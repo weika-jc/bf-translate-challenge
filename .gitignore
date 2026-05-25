@@ -2,3 +2,6 @@
 .vscode
 .claude/settings.local.json
 output/
+__pycache__/
+.hf_cache/
+.cache/
