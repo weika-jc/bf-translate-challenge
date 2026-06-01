@@ -1,0 +1,178 @@
+import csv
+import json
+import math
+import os
+import statistics
+from pathlib import Path
+
+
+def parse_trans(text: str | None) -> str:
+    if not text:
+        return ''
+    text = text.strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and 'c' in data:
+            return str(data['c'])
+    except json.JSONDecodeError:
+        pass
+    return text
+
+
+def _num(value, cast=float):
+    if value is None or value == '':
+        return None
+    try:
+        return cast(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_csv(path: str) -> list[dict]:
+    records = []
+    with open(path, encoding='utf-8', newline='') as f:
+        for row in csv.DictReader(f):
+            score = _num(row.get('score'), int)
+            records.append({
+                'dataset': row.get('dataset', ''),
+                'src': row.get('src', ''),
+                'tgt': row.get('tgt', ''),
+                'lang_pair': f"{row.get('src', '')}→{row.get('tgt', '')}",
+                'raw': row.get('raw', ''),
+                'ref': row.get('ref', ''),
+                'trans': parse_trans(row.get('trans')),
+                'score': score,
+                'input_tokens': _num(row.get('input_tokens'), int),
+                'output_tokens': _num(row.get('output_tokens'), int),
+                'total_tokens': _num(row.get('total_tokens'), int),
+                'latency_ms': _num(row.get('latency_ms'), float),
+            })
+    return records
+
+
+def _avg(values: list) -> float | None:
+    return round(statistics.mean(values), 2) if values else None
+
+
+def _median(values: list) -> float | None:
+    return round(statistics.median(values), 2) if values else None
+
+
+def _p95(values: list) -> float | None:
+    if not values:
+        return None
+    s = sorted(values)
+    pos = 0.95 * (len(s) - 1)
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return round(s[lo], 2)
+    return round(s[lo] + (s[hi] - s[lo]) * (pos - lo), 2)
+
+
+def _low_score_ratio(scores: list[int], threshold: int = 50) -> float | None:
+    if not scores:
+        return None
+    low = sum(1 for s in scores if s < threshold)
+    return round(low / len(scores) * 100, 2)
+
+
+def _score_distribution(scores: list[int], step: int = 4) -> dict:
+    labels = [f"{i}-{i + step - 1}" for i in range(0, 96, step)]
+    labels.append("96-100")
+    buckets = {label: 0 for label in labels}
+    for s in scores:
+        if s >= 96:
+            buckets["96-100"] += 1
+        else:
+            start = (s // step) * step
+            buckets[f"{start}-{start + step - 1}"] += 1
+    return buckets
+
+
+def _latency_distribution(latencies: list[float], step_ms: int = 1000) -> dict:
+    if not latencies:
+        return {}
+    max_i = int(max(latencies) // step_ms)
+    labels = [f"{i * step_ms}-{(i + 1) * step_ms - 1}" for i in range(max_i)]
+    labels.append(f"≥{max_i * step_ms}")
+    buckets = {label: 0 for label in labels}
+    for lat in latencies:
+        i = int(lat // step_ms)
+        if i >= max_i:
+            buckets[labels[-1]] += 1
+        else:
+            buckets[labels[i]] += 1
+    return buckets
+
+
+def _group_stats(records: list[dict], key: str) -> list[dict]:
+    groups: dict[str, list[dict]] = {}
+    for r in records:
+        groups.setdefault(r[key], []).append(r)
+
+    result = []
+    for name, items in sorted(groups.items()):
+        scores = [r['score'] for r in items if r['score'] is not None]
+        latencies = [r['latency_ms'] for r in items if r['latency_ms'] is not None]
+        tokens = [r['total_tokens'] for r in items if r['total_tokens'] is not None]
+        result.append({
+            'name': name,
+            'count': len(items),
+            'avg_score': _avg(scores),
+            'median_score': _median(scores),
+            'min_score': min(scores) if scores else None,
+            'max_score': max(scores) if scores else None,
+            'avg_latency_ms': _avg(latencies),
+            'avg_tokens': _avg(tokens),
+        })
+    return sorted(result, key=lambda x: x['avg_score'] or 0, reverse=True)
+
+
+def summarize(records: list[dict]) -> dict:
+    scores = [r['score'] for r in records if r['score'] is not None]
+    latencies = [r['latency_ms'] for r in records if r['latency_ms'] is not None]
+    input_tokens = [r['input_tokens'] for r in records if r['input_tokens'] is not None]
+    output_tokens = [r['output_tokens'] for r in records if r['output_tokens'] is not None]
+    total_tokens = [r['total_tokens'] for r in records if r['total_tokens'] is not None]
+
+    return {
+        'count': len(records),
+        'scored_count': len(scores),
+        'avg_score': _avg(scores),
+        'median_score': _median(scores),
+        'min_score': min(scores) if scores else None,
+        'max_score': max(scores) if scores else None,
+        'std_score': round(statistics.stdev(scores), 2) if len(scores) > 1 else None,
+        'avg_latency_ms': _avg(latencies),
+        'median_latency_ms': _median(latencies),
+        'p95_latency_ms': _p95(latencies),
+        'low_score_ratio': _low_score_ratio(scores),
+        'avg_input_tokens': _avg(input_tokens),
+        'avg_output_tokens': _avg(output_tokens),
+        'avg_total_tokens': _avg(total_tokens),
+        'input_tokens_sum': sum(input_tokens) if input_tokens else None,
+        'output_tokens_sum': sum(output_tokens) if output_tokens else None,
+        'total_tokens_sum': sum(total_tokens) if total_tokens else None,
+        'score_distribution': _score_distribution(scores),
+        'latency_distribution': _latency_distribution(latencies),
+        'by_dataset': _group_stats(records, 'dataset'),
+        'by_lang_pair': _group_stats(records, 'lang_pair'),
+        'by_src': _group_stats(records, 'src'),
+        'by_tgt': _group_stats(records, 'tgt'),
+    }
+
+
+def load_models(csv_paths: list[str]) -> dict:
+    models = []
+    for path in csv_paths:
+        path = os.path.abspath(path)
+        name = Path(path).stem
+        records = load_csv(path)
+        models.append({
+            'name': name,
+            'path': path,
+            'summary': summarize(records),
+            'records': records,
+        })
+    return {'models': models}

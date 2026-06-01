@@ -4,11 +4,7 @@ import random
 import time
 
 from .dataset import fetch_handlers
-from .utils import check_semantic_similarity, load_embed_model
-
-
-LANGUAGES = ['en', 'es', 'ja', 'de', 'fr', 'nl', 'da', 'no', 'it']
-LANG_PAIRS = list(itertools.combinations(LANGUAGES, 2))
+from .utils import InvalidDatasetError, check_semantic_similarity, load_embed_model
 
 
 def check_similarity(src: str, tgt: str) -> bool:
@@ -16,15 +12,16 @@ def check_similarity(src: str, tgt: str) -> bool:
     return check_semantic_similarity(src, tgt) >= 0.8
 
 
-def pick_pairs(pairs: list[tuple[str, str]], count: int) -> list[tuple[str, str]]:
+def pick_pairs(pairs: list[tuple[str, str]], count: int, need_filter: bool) -> list[tuple[str, str]]:
     indexes = set(range(len(pairs)))
     result = []
     while len(result) < count and len(indexes) > 0:
         index = random.choice(tuple(indexes))
         indexes.remove(index)
         src, tgt = pairs[index]
-        if check_similarity(src, tgt) >= 0.8:
-            result.append((src, tgt))
+        if need_filter and check_similarity(src, tgt) < 0.8:
+            continue
+        result.append((src, tgt))
     return result
 
 
@@ -39,7 +36,8 @@ def fetch_all(dst: str, count = 1000):
         return
 
     for name, handler in fetch_handlers.items():
-        for src, tgt in LANG_PAIRS:
+        lang_pairs = list(itertools.combinations(handler['languages'], 2))
+        for src, tgt in lang_pairs:
             print(f'fetching {name}@{src}-{tgt}... ', end='')
             dst_path = os.path.join(dst, name)
             src_path = os.path.join(dst_path, f'{src}.{tgt}.txt')
@@ -49,13 +47,19 @@ def fetch_all(dst: str, count = 1000):
                 continue
 
             start_time = time.time()
-            pairs, reason = handler(src, tgt)
+            pairs, reason = handler['handler'](src, tgt)
             if pairs is None:
-                print(f'{name} failed: {reason}')
+                if reason == InvalidDatasetError:
+                    print(f'{name} not supported, skipped')
+                else:
+                    print(f'{name} failed: {reason}')
+                continue
+            if len(pairs) == 0:
+                print(f'{name} failed: no valid samples')
                 continue
 
             print(f'{len(pairs)} pairs fetched, filtering... ', end='')
-            pairs = pick_pairs(pairs, count)
+            pairs = pick_pairs(pairs, count, handler.get('need_filter', True))
             if len(pairs) == 0:
                 print(f'{name} failed: no valid samples')
                 continue
