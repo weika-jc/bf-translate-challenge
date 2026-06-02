@@ -6,17 +6,23 @@ import statistics
 from pathlib import Path
 
 
-def parse_trans(text: str | None) -> str:
-    if not text:
-        return ''
-    text = text.strip()
+def validate_trans_json(text: str | None) -> tuple[bool, str]:
+    """解析翻译结果 JSON；格式正确且含 \"c\" 字段视为有效。"""
+    if not text or not str(text).strip():
+        return False, ''
+    raw = str(text).strip()
     try:
-        data = json.loads(text)
-        if isinstance(data, dict) and 'c' in data:
-            return str(data['c'])
+        data = json.loads(raw)
     except json.JSONDecodeError:
-        pass
-    return text
+        return False, raw
+    if not isinstance(data, dict) or 'c' not in data:
+        return False, raw
+    return True, str(data['c'])
+
+
+def parse_trans(text: str | None) -> str:
+    valid, content = validate_trans_json(text)
+    return content if valid else (str(text).strip() if text else '')
 
 
 def _num(value, cast=float):
@@ -28,11 +34,24 @@ def _num(value, cast=float):
         return None
 
 
+def _is_empty(value) -> bool:
+    return value is None or str(value).strip() == ''
+
+
+def is_call_failed(raw_trans, raw_latency) -> bool:
+    """模型输出或延迟为空视为调用失败。"""
+    return _is_empty(raw_trans) or _is_empty(raw_latency)
+
+
 def load_csv(path: str) -> list[dict]:
     records = []
     with open(path, encoding='utf-8', newline='') as f:
         for row in csv.DictReader(f):
             score = _num(row.get('score'), int)
+            raw_trans = row.get('trans')
+            raw_latency = row.get('latency_ms')
+            trans_valid, trans = validate_trans_json(raw_trans)
+            call_failed = is_call_failed(raw_trans, raw_latency)
             records.append({
                 'dataset': row.get('dataset', ''),
                 'src': row.get('src', ''),
@@ -40,7 +59,9 @@ def load_csv(path: str) -> list[dict]:
                 'lang_pair': f"{row.get('src', '')}→{row.get('tgt', '')}",
                 'raw': row.get('raw', ''),
                 'ref': row.get('ref', ''),
-                'trans': parse_trans(row.get('trans')),
+                'trans': trans,
+                'trans_valid': trans_valid,
+                'call_failed': call_failed,
                 'score': score,
                 'input_tokens': _num(row.get('input_tokens'), int),
                 'output_tokens': _num(row.get('output_tokens'), int),
@@ -135,9 +156,19 @@ def summarize(records: list[dict]) -> dict:
     input_tokens = [r['input_tokens'] for r in records if r['input_tokens'] is not None]
     output_tokens = [r['output_tokens'] for r in records if r['output_tokens'] is not None]
     total_tokens = [r['total_tokens'] for r in records if r['total_tokens'] is not None]
+    malformed_count = sum(1 for r in records if not r['trans_valid'])
+    valid_count = len(records) - malformed_count
+    call_failed_count = sum(1 for r in records if r['call_failed'])
+    call_success_count = len(records) - call_failed_count
 
     return {
         'count': len(records),
+        'valid_count': valid_count,
+        'malformed_count': malformed_count,
+        'malformed_ratio': round(malformed_count / len(records) * 100, 2) if records else None,
+        'call_failed_count': call_failed_count,
+        'call_success_count': call_success_count,
+        'call_failure_ratio': round(call_failed_count / len(records) * 100, 2) if records else None,
         'scored_count': len(scores),
         'avg_score': _avg(scores),
         'median_score': _median(scores),

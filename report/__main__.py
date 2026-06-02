@@ -8,8 +8,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .analyze import load_models
-from .pricing import get_pricing
+from .build import build_static, prepare_models_data
 
 STATIC_DIR = Path(__file__).parent / 'static'
 
@@ -111,6 +110,8 @@ def main():
     parser.add_argument('--dir', '-d', default='result', help='扫描 CSV 的目录 (默认: result)')
     parser.add_argument('--port', '-p', type=int, default=8765, help='服务端口 (默认: 8765)')
     parser.add_argument('--host', default='127.0.0.1', help='绑定地址 (默认: 127.0.0.1)')
+    parser.add_argument('--build', '-b', action='store_true', help='构建静态网站（无需启动服务）')
+    parser.add_argument('--output', '-o', default='dist/report', help='静态网站输出目录 (默认: dist/report)')
     args = parser.parse_args()
 
     paths = resolve_csv_paths(args.csv, args.dir if not args.csv else None)
@@ -122,18 +123,15 @@ def main():
     for p in paths:
         print(f'  - {p}')
 
-    models_data = load_models(paths)
-    # attach fixed pricing into response payload
-    models_data['pricing'] = {}
-    for m in models_data['models']:
-        p = get_pricing(m['name'])
-        models_data['pricing'][m['name']] = {
-            'input_per_million': p.input_per_million,
-            'output_per_million': p.output_per_million,
-            'billing_mode': p.billing_mode,
-            'cached_input_ratio': p.cached_input_ratio,
-        }
-    ReportHandler.models_data = models_data
+    if args.build:
+        out = build_static(args.output, paths)
+        size_mb = sum(f.stat().st_size for f in out.rglob('*') if f.is_file()) / (1024 * 1024)
+        print(f'\n静态网站已生成: {out.resolve()}')
+        print(f'  共 {len(paths)} 个模型, 约 {size_mb:.1f} MB')
+        print('  用浏览器打开 index.html，或: python -m http.server --directory dist/report')
+        return
+
+    ReportHandler.models_data = prepare_models_data(paths)
     handler = partial(ReportHandler)
     server = ThreadingHTTPServer((args.host, args.port), handler)
 

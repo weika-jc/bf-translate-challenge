@@ -1,3 +1,5 @@
+const STATIC_MODE = typeof window.REPORT_DATA !== 'undefined';
+
 const state = {
   data: null,
   activeModel: null,
@@ -43,6 +45,20 @@ function fmtPct(v) {
   return `${v}%`;
 }
 
+function fmtMalformed(summary) {
+  const n = summary.malformed_count;
+  if (n == null) return '—';
+  const ratio = summary.malformed_ratio;
+  return ratio != null ? `${n} (${ratio}%)` : String(n);
+}
+
+function fmtCallFailed(summary) {
+  const n = summary.call_failed_count;
+  if (n == null) return '—';
+  const ratio = summary.call_failure_ratio;
+  return ratio != null ? `${n} (${ratio}%)` : String(n);
+}
+
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = s ?? '';
@@ -60,14 +76,48 @@ function latencySortKey(label) {
 }
 
 async function loadData() {
-  const res = await fetch('/api/data');
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  state.data = await res.json();
+  if (STATIC_MODE) {
+    state.data = window.REPORT_DATA;
+  } else {
+    const res = await fetch('/api/data');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    state.data = await res.json();
+  }
   if (!state.data.models.length) throw new Error('无数据');
   state.activeModel = state.data.models[0].name;
   document.getElementById('loading').classList.add('hidden');
   document.getElementById('content').classList.remove('hidden');
   render();
+}
+
+function filterRecordsClient() {
+  const dataset = document.getElementById('filter-dataset').value;
+  const langPair = document.getElementById('filter-langpair').value;
+  const minScore = document.getElementById('filter-min-score').value;
+  const maxScore = document.getElementById('filter-max-score').value;
+  const q = document.getElementById('filter-q').value.toLowerCase();
+
+  const records = [];
+  for (const m of state.data.models) {
+    if (state.viewMode === 'single' && m.name !== state.activeModel) continue;
+    for (const r of m.records) {
+      const item = { ...r, model: m.name };
+      if (dataset && item.dataset !== dataset) continue;
+      if (langPair && item.lang_pair !== langPair) continue;
+      if (minScore && (item.score == null || item.score < Number(minScore))) continue;
+      if (maxScore && (item.score == null || item.score > Number(maxScore))) continue;
+      if (q && !item.raw.toLowerCase().includes(q) && !item.trans.toLowerCase().includes(q) && !item.ref.toLowerCase().includes(q)) continue;
+      records.push(item);
+    }
+  }
+  const total = records.length;
+  const start = (state.page - 1) * state.pageSize;
+  return {
+    total,
+    page: state.page,
+    page_size: state.pageSize,
+    records: records.slice(start, start + state.pageSize),
+  };
 }
 
 function getModelPrice(modelName) {
@@ -151,6 +201,19 @@ function aggregateSummary(models) {
     avg_latency_ms: avg(latencies),
     avg_total_tokens: avg(tokens),
     total_tokens_sum: tokens.length ? tokens.reduce((a, b) => a + b, 0) : null,
+    malformed_count: models.reduce((n, m) => n + (m.summary.malformed_count ?? 0), 0),
+    valid_count: models.reduce((n, m) => n + (m.summary.valid_count ?? 0), 0),
+    malformed_ratio: (() => {
+      const total = models.reduce((n, m) => n + (m.summary.count ?? 0), 0);
+      const bad = models.reduce((n, m) => n + (m.summary.malformed_count ?? 0), 0);
+      return total ? Math.round(bad / total * 10000) / 100 : null;
+    })(),
+    call_failed_count: models.reduce((n, m) => n + (m.summary.call_failed_count ?? 0), 0),
+    call_failure_ratio: (() => {
+      const total = models.reduce((n, m) => n + (m.summary.count ?? 0), 0);
+      const bad = models.reduce((n, m) => n + (m.summary.call_failed_count ?? 0), 0);
+      return total ? Math.round(bad / total * 10000) / 100 : null;
+    })(),
   };
 }
 
@@ -175,6 +238,8 @@ function renderOverview() {
     { label: '平均 Token', value: fmt(s.avg_total_tokens) },
     { label: '总 Token', value: fmt(s.total_tokens_sum) },
     { label: '样本数', value: fmt(s.count) },
+    { label: 'Malformed', value: fmtMalformed(s) },
+    { label: '调用失败', value: fmtCallFailed(s) },
   ];
 
   document.getElementById('overview-cards').innerHTML = cards.map(c => `
@@ -207,6 +272,8 @@ function renderCompare() {
       <td class="num">${fmt(s.avg_latency_ms, ' ms')}</td>
       <td class="num">${fmt(s.p95_latency_ms, ' ms')}</td>
       <td class="num">${fmtPct(s.low_score_ratio)}</td>
+      <td class="num">${fmtMalformed(s)}</td>
+      <td class="num">${fmtCallFailed(s)}</td>
       <td class="num">${fmtMoney(totalCost)}</td>
     </tr>`;
   }).join('');
@@ -362,26 +429,30 @@ function populateFilters() {
 }
 
 async function loadRecords() {
-  const params = new URLSearchParams({
-    page: state.page,
-    page_size: state.pageSize,
-  });
-  if (state.viewMode === 'single') params.set('model', state.activeModel);
+  const data = STATIC_MODE
+    ? filterRecordsClient()
+    : await (async () => {
+        const params = new URLSearchParams({
+          page: state.page,
+          page_size: state.pageSize,
+        });
+        if (state.viewMode === 'single') params.set('model', state.activeModel);
 
-  const dataset = document.getElementById('filter-dataset').value;
-  const langPair = document.getElementById('filter-langpair').value;
-  const minScore = document.getElementById('filter-min-score').value;
-  const maxScore = document.getElementById('filter-max-score').value;
-  const q = document.getElementById('filter-q').value;
+        const dataset = document.getElementById('filter-dataset').value;
+        const langPair = document.getElementById('filter-langpair').value;
+        const minScore = document.getElementById('filter-min-score').value;
+        const maxScore = document.getElementById('filter-max-score').value;
+        const q = document.getElementById('filter-q').value;
 
-  if (dataset) params.set('dataset', dataset);
-  if (langPair) params.set('lang_pair', langPair);
-  if (minScore) params.set('min_score', minScore);
-  if (maxScore) params.set('max_score', maxScore);
-  if (q) params.set('q', q);
+        if (dataset) params.set('dataset', dataset);
+        if (langPair) params.set('lang_pair', langPair);
+        if (minScore) params.set('min_score', minScore);
+        if (maxScore) params.set('max_score', maxScore);
+        if (q) params.set('q', q);
 
-  const res = await fetch(`/api/records?${params}`);
-  const data = await res.json();
+        const res = await fetch(`/api/records?${params}`);
+        return res.json();
+      })();
   renderRecords(data);
 }
 
